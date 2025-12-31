@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # --- Service 1: The Model Server (vLLM) ---
+  vllm_server:
+    image: vllm/vllm-openai:v0.6.3.post1  # Pin strict version (0.13.0 is old/buggy on WSL)
+    container_name: vllm_server
+    # ------------------------------
+    runtime: nvidia
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      # CRITICAL FIX FOR WSL2: Hardcoded paths to avoid host interpolation issues
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 
+    volumes:
+      - ./models:/opt/airflow/models
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      # OPTIONAL: Map WSL libs explicitly if environment var alone fails (rarely needed but safe)
+      # - /usr/lib/wsl/lib:/usr/lib/wsl/lib 
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+      # FIX: Map libcuda.so.1 to libcuda.so so the linker finds it
+      - /usr/lib/wsl/lib/libcuda.so.1:/usr/lib/wsl/lib/libcuda.so:ro
+    ports:
+      - "8000:8000"
+    command: >
+      --model Qwen/Qwen2.5-1.5B-Instruct
+      --enable-lora
+      --lora-modules Qwen2.5_CostumerService=/opt/airflow/models/adapters/adapter_test
+      --max-lora-rank 64
+      --gpu-memory-utilization 0.8
+      --max-model-len 4096
+      --host 0.0.0.0
+      --port 8000
+
+  # --- Service 2: The Pipeline Manager (Airflow) ---
+  airflow:
+    build: .
+    container_name: airflow_scheduler
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    user: root # Run as root to access docker socket easily
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__HOSTNAME_CALLABLE=airflow.utils.net.get_host_ip_address
+      - HF_TOKEN=${HF_TOKEN}
+      - VLLM_HOST=http://vllm_server:8000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Mount Docker Socket
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - ./results:/opt/airflow/results
+      - ./models/adapters:/opt/airflow/models/adapters
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      echo 'Waiting for Postgres...';
+      while ! nc -z postgres 5432; do   
+        sleep 1;
+      done;
+      echo 'Postgres started. Initializing Airflow DB...';
+      airflow db init || airflow db migrate;
+      airflow users create --username admin --password admin --firstname User --lastname One --role Admin --email admin@example.com; 
+      airflow scheduler & airflow webserver"
+    depends_on:
+      - postgres
+      - vllm_server
+
+  # --- Service 3: Database ---
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+
+  # --- Service 4: Chat UI ---
+  ui:
+    image: python:3.10-slim
+    container_name: chat_ui
+    environment:
+      - VLLM_API_URL=http://vllm_server:8000/v1
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src/ui:/app
+    working_dir: /app
+    command: >
+      bash -c "pip install streamlit openai && streamlit run app.py"
+    depends_on:
+      - vllm_server
