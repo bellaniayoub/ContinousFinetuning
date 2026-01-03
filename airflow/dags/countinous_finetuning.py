@@ -1,14 +1,16 @@
 from airflow import DAG
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import BranchPythonOperator
-from airflow.operators.empty import EmptyOperator # (Was DummyOperator in older versions)
+from airflow.operators.python import BranchPythonOperator, ShortCircuitOperator
+from airflow.operators.empty import EmptyOperator
 from airflow.models.param import Param
 from datetime import datetime
 import os
+import glob
+import shutil
 
 # --- Configurations ---
 PROJECT_ROOT = "/opt/airflow" 
-QUALITY_THRESHOLD = 0.15 # Minimum BLEU score required to merge
+QUALITY_THRESHOLD = 0.15 
 
 default_args = {
     'owner': 'mlops_engineer',
@@ -17,20 +19,57 @@ default_args = {
     'retries': 0,
 }
 
-# --- Python Function for the Branching Logic ---
+# --- 1. Sensing Logic ---
+def sense_and_move_file(**kwargs):
+    """
+    Checks data/input for new JSONL files.
+    If found: Moves to data/processed and pushes paths to XCom.
+    If empty: Returns False (skips pipeline).
+    """
+    input_dir = f"{PROJECT_ROOT}/data/input"
+    files = glob.glob(f"{input_dir}/*.jsonl")
+    
+    if not files:
+        print("No new files found. Skipping.")
+        return False
+    
+    # Take the first file
+    file_path = files[0]
+    filename = os.path.basename(file_path)
+    base_name = os.path.splitext(filename)[0]
+    
+    # Generate timestamped name to avoid collisions
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    adapter_name = f"adapter_{base_name}_{timestamp}"
+    new_filename = f"{base_name}_{timestamp}.jsonl"
+    
+    processed_dir = f"{PROJECT_ROOT}/data/processed"
+    os.makedirs(processed_dir, exist_ok=True)
+    new_path = f"{processed_dir}/{new_filename}"
+    
+    print(f"Moving {file_path} -> {new_path}")
+    shutil.move(file_path, new_path)
+    
+    # Push to XCom
+    ti = kwargs['ti']
+    ti.xcom_push(key='data_path', value=f"data/processed/{new_filename}")
+    ti.xcom_push(key='adapter_name', value=adapter_name)
+    
+    return True
+
+# --- 2. Quality Check Logic ---
 def check_model_quality(**kwargs):
-    """
-    Reads the eval_results.txt file created by the evaluate task.
-    Decides whether to merge or stop based on the score.
-    """
-    # 1. Get the adapter path from the DAG params
-    adapter_name = kwargs['dag_run'].conf.get('adapter_name')
+    ti = kwargs['ti']
+    # Try getting from XCom first (Auto mode), else Param (Manual mode)
+    adapter_name = ti.xcom_pull(key='adapter_name', task_ids='sense_file')
+    if not adapter_name:
+        adapter_name = kwargs['dag_run'].conf.get('adapter_name')
+
     results_path = f"{PROJECT_ROOT}/models/adapters/{adapter_name}/eval_results.txt"
     
     print(f"Checking results at: {results_path}")
     
     try:
-        # 2. Read the file (Format: "BLEU: 0.25\nBERTScore: 0.88")
         scores = {}
         with open(results_path, 'r') as f:
             lines = f.readlines()
@@ -40,105 +79,94 @@ def check_model_quality(**kwargs):
                     scores[key.strip()] = float(val.strip())
             
         bleu_score = scores.get('BLEU', 0.0)
-        bert_score = scores.get('BERTScore', 0.0)
-            
-        print(f"Detected Scores - BLEU: {bleu_score}, BERTScore: {bert_score}")
-        print(f"Thresholds - BLEU: {QUALITY_THRESHOLD}")
+        print(f"Detected BLEU: {bleu_score} (Threshold: {QUALITY_THRESHOLD})")
 
-        # 3. The Decision (Currently just checks BLEU, but ready for BERTScore logic)
         if bleu_score >= QUALITY_THRESHOLD:
-            print("✅ Quality Check PASSED. Proceeding to Merge.")
             return 'merge_adapter'
         else:
-            print("❌ Quality Check FAILED. Stopping pipeline.")
             return 'stop_low_quality'
             
     except Exception as e:
         print(f"Error reading results: {e}")
-        # If we can't read the score, we should probably fail safe and stop
         return 'stop_low_quality'
 
 # --- The DAG Definition ---
 with DAG(
     'continuous_finetuning_pipeline',
     default_args=default_args,
-    schedule_interval=None, 
+    schedule_interval='*/5 * * * *', # Run every 5 minutes
     catchup=False,
     params={
-        "data_path": Param(default="data/processed/batch_2_logistics.jsonl", type="string", description="Training Data Path"),
-        "adapter_name": Param(default="adapter_v2_docker", type="string", description="Adapter Output Name"),
+        "data_path": Param(default="data/processed/default.jsonl", type="string", description="Training Data Path (Manual Trigger Only)"),
+        "adapter_name": Param(default="manual_adapter", type="string", description="Adapter Output Name (Manual Trigger Only)"),
     },
 ) as dag:
 
-    # 1. Start
-    start = BashOperator(
-        task_id='start_pipeline',
-        bash_command='echo "Starting MLOps Pipeline with Quality Gate..."',
+    # 1. Sense File (ShortCircuit)
+    sense_file = ShortCircuitOperator(
+        task_id='sense_file',
+        python_callable=sense_and_move_file,
+        provide_context=True,
     )
 
-    # 2. Train
+    # 2. Train (Dynamic Params)
     train_model = BashOperator(
         task_id='train_adapter',
         bash_command=f"""
         cd {PROJECT_ROOT} && \
-        python src/scripts/train.py \
-        {{{{ dag_run.conf.get('data_path') }}}} \
-        {{{{ dag_run.conf.get('adapter_name') }}}}
+        DATA_PATH="{{{{ ti.xcom_pull(key='data_path', task_ids='sense_file') or dag_run.conf.get('data_path') }}}}" && \
+        ADAPTER_NAME="{{{{ ti.xcom_pull(key='adapter_name', task_ids='sense_file') or dag_run.conf.get('adapter_name') }}}}" && \
+        echo "Training on: $DATA_PATH as $ADAPTER_NAME" && \
+        python src/scripts/train.py $DATA_PATH $ADAPTER_NAME
         """,
     )
 
     # 3. Evaluate
-    # This script writes 'eval_results.txt' which the next task reads
     evaluate_model = BashOperator(
         task_id='evaluate_model',
         bash_command=f"""
         cd {PROJECT_ROOT} && \
-        python src/scripts/evaluates.py \
-        {{{{ dag_run.conf.get('adapter_name') }}}}
+        ADAPTER_NAME="{{{{ ti.xcom_pull(key='adapter_name', task_ids='sense_file') or dag_run.conf.get('adapter_name') }}}}" && \
+        python src/scripts/evaluates.py $ADAPTER_NAME
         """,
-        # Note: evaluates.py only takes adapter_name now and calculates paths internally
     )
 
-    # 4. Quality Gate (The New Logic)
+    # 4. Quality Gate
     quality_check = BranchPythonOperator(
         task_id='quality_check',
         python_callable=check_model_quality,
         provide_context=True,
     )
 
-    # 5a. Branch A: Merge (Success)
+    # 5a. Merge
     merge_adapter = BashOperator(
         task_id='merge_adapter',
         bash_command=f"""
         cd {PROJECT_ROOT} && \
+        ADAPTER_NAME="{{{{ ti.xcom_pull(key='adapter_name', task_ids='sense_file') or dag_run.conf.get('adapter_name') }}}}" && \
         python src/scripts/merge.py \
-        {PROJECT_ROOT}/models/adapters/{{{{ dag_run.conf.get('adapter_name') }}}} \
-        {PROJECT_ROOT}/models/adapters/merged_{{{{ dag_run.conf.get('adapter_name') }}}}
+        {PROJECT_ROOT}/models/adapters/$ADAPTER_NAME \
+        {PROJECT_ROOT}/models/adapters/merged_$ADAPTER_NAME
         """,
     )
 
-    # 5b. Branch B: Stop (Failure)
-    stop_low_quality = EmptyOperator(
-        task_id='stop_low_quality'
-    )
+    # 5b. Stop
+    stop_low_quality = EmptyOperator(task_id='stop_low_quality')
 
-    # 6. Deploy (Only happens after Merge)
+    # 6. Deploy
     deploy_model = BashOperator(
         task_id='deploy_to_vllm',
         bash_command=f"""
         cd {PROJECT_ROOT} && \
+        ADAPTER_NAME="{{{{ ti.xcom_pull(key='adapter_name', task_ids='sense_file') or dag_run.conf.get('adapter_name') }}}}" && \
         python src/scripts/deploy.py \
-        {{{{ dag_run.conf.get('adapter_name') }}}} \
-        {PROJECT_ROOT}/models/adapters/merged_{{{{ dag_run.conf.get('adapter_name') }}}}
+        $ADAPTER_NAME \
+        {PROJECT_ROOT}/models/adapters/merged_$ADAPTER_NAME
         """,
-        trigger_rule='none_failed' # Only run if upstream didn't fail
+        trigger_rule='none_failed'
     )
 
-
-    # --- Define the Flow ---
-    # 1. Linear part
-    start >> train_model >> evaluate_model >> quality_check
-    
-    # 2. Branching part
-    quality_check >> merge_adapter >> deploy_model  # Path A (Success)
-    quality_check >> stop_low_quality               # Path B (Failure)
+    # --- Flow ---
+    sense_file >> train_model >> evaluate_model >> quality_check
+    quality_check >> merge_adapter >> deploy_model
+    quality_check >> stop_low_quality
